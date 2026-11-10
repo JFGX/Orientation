@@ -1,0 +1,14 @@
+Task 1 – References. Four links in the docs point to the wrong place. I haven’t changed any of them; tell me if you want them fixed.
+
++The FSD says PicoWToRPiHarness.md, but the file is called PicoWToHarness.md.
++The FSD’s BNO085 link Devices\BNO08x\BNO08x.md doesn’t exist. The file is at Devices\BNO08x-9DoF\BNO08x.md.
+The FSD’s PicoW link Devices\RPiPico\RpiPico.md is the doc for the plain Pico, not the Pico W. The Pico W doc is Devices\RPiPicoW\RPiPicoW.md.
+WS128.md points to Devices\WS128\WS128-Software, but the folder is Devices\Waveshare128\WS128-Software.
+
+
+
+Improvements:
+Data sampling 10Hz
+Refresh display at 2Hz
+Better RPi power!
+

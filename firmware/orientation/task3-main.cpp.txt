@@ -1,0 +1,252 @@
+// Orientation app (FSD.md task 3).
+//  - 4 times per second, reads calibrated angular velocity (X, Y, Z) from the
+//    BNO085 on I2C0 (SDA GP4 / SCL GP5). The sensor is asked for one gyro
+//    report every 250 ms and each report is one reading.
+//  - Keeps the readings from the previous second and, once per second, shows
+//    their average for each axis on the WS128 in degrees per second:
+//    X = "Pitch", Y = "Roll", Z = "Yaw".
+//  - Echoes each displayed line to Serial1 (UART0 -> Debug Probe -> bench
+//    slot "probe"), since the bench can't see the screen.
+#include <Arduino.h>
+#include <Wire.h>
+#include <hardware/structs/sio.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_GC9A01A.h>
+#include <Adafruit_BNO08x.h>
+#include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+
+static const int PIN_SDA = 4, PIN_SCL = 5;
+static const int PIN_DIN = 22, PIN_CLK = 21, PIN_CS = 20, PIN_DC = 19, PIN_RST = 18, PIN_BL = 17;
+
+static const uint32_t REPORT_US = 50000;    // sensor streams gyro at 20 Hz
+static const uint32_t SAMPLE_MS = 250;      // we take a reading 4 times per second
+static const uint32_t DISPLAY_MS = 1000;    // display once per second
+static const uint32_t WINDOW_MS = 1000;     // average over the previous second
+static const float RAD_TO_DEGF = 57.2957795f;
+
+static Adafruit_GC9A01A tft(PIN_CS, PIN_DC, PIN_DIN, PIN_CLK, PIN_RST);
+static Adafruit_BNO08x bno(-1);  // BNO085 RST pin isn't wired
+
+// ---- Readings from the previous second -------------------------------------
+
+struct Reading {
+  uint32_t ms;
+  float x, y, z;  // deg/s
+};
+static const int RING = 8;  // room for a few more than the 4 expected per second
+static Reading ring[RING];
+static int ringNext = 0, ringCount = 0;
+
+static void addReading(float x, float y, float z) {
+  ring[ringNext] = {millis(), x, y, z};
+  ringNext = (ringNext + 1) % RING;
+  if (ringCount < RING) ringCount++;
+}
+
+// Average of the readings taken within the last WINDOW_MS. Returns how many.
+static int averageLastSecond(float &x, float &y, float &z) {
+  uint32_t now = millis();
+  int n = 0;
+  x = y = z = 0;
+  for (int i = 0; i < ringCount; i++) {
+    const Reading &r = ring[i];
+    if (now - r.ms <= WINDOW_MS) {
+      x += r.x; y += r.y; z += r.z;
+      n++;
+    }
+  }
+  if (n) { x /= n; y /= n; z /= n; }
+  return n;
+}
+
+// ---- Sensor ------------------------------------------------------------------
+
+static bool sensorUp = false;
+
+static bool startSensor() {
+  if (!bno.begin_I2C(0x4A, &Wire) && !bno.begin_I2C(0x4B, &Wire)) return false;
+  return bno.enableReport(SH2_GYROSCOPE_CALIBRATED, REPORT_US);
+}
+
+// Latest gyro report from the sensor (deg/s); a reading copies it every SAMPLE_MS.
+static float latest[3];
+static bool haveLatest = false;
+
+static void pollSensor() {
+  if (!sensorUp) return;
+  if (bno.wasReset()) {
+    Serial1.println("bno: sensor reset, re-enabling gyro");
+    bno.enableReport(SH2_GYROSCOPE_CALIBRATED, REPORT_US);
+  }
+  sh2_SensorValue_t v;
+  while (bno.getSensorEvent(&v)) {
+    if (v.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+      latest[0] = v.un.gyroscope.x * RAD_TO_DEGF;
+      latest[1] = v.un.gyroscope.y * RAD_TO_DEGF;
+      latest[2] = v.un.gyroscope.z * RAD_TO_DEGF;
+      haveLatest = true;
+    }
+  }
+}
+
+// One reading = the newest gyro report, taken on the 4 Hz timer. Skipped if no
+// report has arrived since the last reading (sensor stalled or missing).
+static void takeReading() {
+  if (!haveLatest) return;
+  addReading(latest[0], latest[1], latest[2]);
+  haveLatest = false;
+}
+
+// ---- Display -----------------------------------------------------------------
+
+// One row: label on the left, value on the right. Drawn off-screen and pushed in
+// one go so values don't flicker.
+static const int ROW_W = 200, ROW_H = 40, ROW_X = 20;
+static const int ROW_Y[3] = {64, 110, 156};
+static const char *LABELS[3] = {"Pitch", "Roll", "Yaw"};
+static const uint16_t COLOURS[3] = {GC9A01A_ORANGE, GC9A01A_GREEN, GC9A01A_CYAN};
+static GFXcanvas16 rowCanvas(ROW_W, ROW_H);
+
+// Bit-bang one 16-bit pixel (SPI mode 0, MSB first) straight through the SIO
+// registers. Adafruit's software SPI goes through digitalWrite() per bit and
+// needed ~1.2 s to push the three rows, which starved the 4 Hz sampling. The
+// nops keep each clock phase well above the GC9A01's 15 ns minimum.
+#define SPI_NOP() __asm volatile("nop\n nop\n nop\n")
+static inline void fastWrite16(uint16_t v) {
+  const uint32_t mosi = 1u << PIN_DIN, clk = 1u << PIN_CLK;
+  for (int b = 15; b >= 0; b--) {
+    if (v & (1u << b)) sio_hw->gpio_set = mosi;
+    else sio_hw->gpio_clr = mosi;
+    SPI_NOP();
+    sio_hw->gpio_set = clk;
+    SPI_NOP();
+    sio_hw->gpio_clr = clk;
+  }
+}
+
+// Adafruit's drawRGBBitmap()/writePixels() hang with software SPI on the RP2040,
+// so the window is set through the library and the pixels are sent by hand
+// (CS stays low and DC stays in data mode after setAddrWindow()).
+static void pushCanvas(int x, int y, GFXcanvas16 &c) {
+  const uint16_t *px = c.getBuffer();
+  uint32_t n = (uint32_t)c.width() * c.height();
+  tft.startWrite();
+  tft.setAddrWindow(x, y, c.width(), c.height());
+  for (uint32_t i = 0; i < n; i++) fastWrite16(px[i]);
+  tft.endWrite();
+}
+
+// printf("%f") prints nothing in this core, so format tenths by hand.
+static void formatTenths(char *out, size_t size, float value) {
+  long tenths = lroundf(value * 10.0f);
+  const char *sign = tenths < 0 ? "-" : "";
+  tenths = labs(tenths);
+  snprintf(out, size, "%s%ld.%ld", sign, tenths / 10, tenths % 10);
+}
+
+static void drawRow(int i, const char *value) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  rowCanvas.fillScreen(GC9A01A_BLACK);
+  rowCanvas.setFont(&FreeSans12pt7b);
+  rowCanvas.setTextColor(COLOURS[i]);
+  rowCanvas.setCursor(4, 29);
+  rowCanvas.print(LABELS[i]);
+  rowCanvas.setFont(&FreeSansBold18pt7b);
+  rowCanvas.setTextColor(GC9A01A_WHITE);
+  rowCanvas.getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
+  rowCanvas.setCursor(ROW_W - 4 - (int)w - x1, 31);
+  rowCanvas.print(value);
+  pushCanvas(ROW_X, ROW_Y[i], rowCanvas);
+}
+
+static void drawStatic() {
+  tft.fillScreen(GC9A01A_BLACK);
+  GFXcanvas16 title(120, 26);
+  title.setFont(&FreeSans12pt7b);
+  title.setTextColor(GC9A01A_DARKGREY);
+  int16_t x1, y1;
+  uint16_t w, h;
+  title.getTextBounds("deg/s", 0, 0, &x1, &y1, &w, &h);
+  title.setCursor((120 - (int)w) / 2 - x1, 19);
+  title.print("deg/s");
+  pushCanvas(60, 30, title);
+}
+
+static void showStatus(const char *text, uint16_t colour) {
+  GFXcanvas16 c(140, 22);
+  c.setFont(nullptr);
+  c.setTextSize(1);
+  c.setTextColor(colour);
+  c.setCursor((140 - 6 * (int)strlen(text)) / 2, 7);
+  c.print(text);
+  pushCanvas(50, 204, c);
+}
+
+// ---- Main --------------------------------------------------------------------
+
+void setup() {
+  Serial1.begin(115200);
+  Serial1.println();
+  Serial1.println("orientation: boot");
+
+  pinMode(PIN_BL, OUTPUT);
+  digitalWrite(PIN_BL, HIGH);
+  tft.begin();
+  drawStatic();
+  for (int i = 0; i < 3; i++) drawRow(i, "--");
+
+  Wire.setSDA(PIN_SDA);
+  Wire.setSCL(PIN_SCL);
+  Wire.begin();
+  sensorUp = startSensor();
+  Serial1.println(sensorUp ? "bno: gyro enabled at 4 Hz" : "bno: NOT FOUND");
+  showStatus(sensorUp ? "" : "BNO085 not found", GC9A01A_RED);
+  Serial1.println("orientation: ready");
+}
+
+// Drain the sensor and take a reading whenever one is due. Called from loop()
+// and between display rows, so a redraw can never skip a reading.
+static uint32_t nextSample = 0;
+static void service() {
+  pollSensor();
+  if ((int32_t)(millis() - nextSample) >= 0) {
+    nextSample += SAMPLE_MS;
+    takeReading();
+  }
+}
+
+void loop() {
+  static uint32_t nextShow = millis() + DISPLAY_MS + SAMPLE_MS / 2;  // between samples
+  static uint32_t nextRetry = 0;
+  if (nextSample == 0) nextSample = millis() + SAMPLE_MS;
+
+  service();
+
+  uint32_t now = millis();
+  if (!sensorUp && (int32_t)(now - nextRetry) >= 0) {
+    nextRetry = now + 5000;
+    sensorUp = startSensor();
+    if (sensorUp) {
+      Serial1.println("bno: found on retry");
+      showStatus("", GC9A01A_BLACK);
+    }
+  }
+
+  if ((int32_t)(now - nextShow) < 0) return;
+  nextShow += DISPLAY_MS;
+
+  float avg[3];
+  int n = averageLastSecond(avg[0], avg[1], avg[2]);
+  char text[3][12];
+  uint32_t t0 = millis();
+  for (int i = 0; i < 3; i++) {
+    if (n) formatTenths(text[i], sizeof text[i], avg[i]);
+    else strcpy(text[i], "--");
+    drawRow(i, text[i]);
+    service();
+  }
+  Serial1.printf("show: Pitch=%s Roll=%s Yaw=%s deg/s (n=%d, draw %lu ms)\n", text[0], text[1],
+                 text[2], n, (unsigned long)(millis() - t0));
+}
